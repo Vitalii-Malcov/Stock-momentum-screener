@@ -9,9 +9,9 @@ Stock Momentum Screener
     python app.py --min-change 5 --file tickers.csv
 """
 
-import os
 import sys
 import csv
+import html
 import json
 import time
 import logging
@@ -26,45 +26,36 @@ import pandas as pd
 import yfinance as yf
 
 # ─────────────────────────────────────────────
-# НАСТРОЙКА ЛОГИРОВАНИЯ
+# CONSTANTS & PATHS
 # ─────────────────────────────────────────────
 
 LOG_DIR = Path("logs")
-LOG_DIR.mkdir(exist_ok=True)
-
-import sys
-
-# Принудительно UTF-8 для вывода в консоль на Windows
-if sys.platform == "win32":
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_DIR / "errors.log", encoding="utf-8"),  # + encoding здесь
-        logging.StreamHandler(sys.stdout),
-    ],
-)
-logger = logging.getLogger(__name__)
-
+CACHE_DIR = Path("cache")
+HISTORY_DIR = Path("history")
 processed_log = LOG_DIR / "processed.log"
 
-# ─────────────────────────────────────────────
-# КОНСТАНТЫ
-# ─────────────────────────────────────────────
+logger = logging.getLogger(__name__)
 
-CACHE_DIR = Path("cache")
-CACHE_DIR.mkdir(exist_ok=True)
+BATCH_SIZE = 50
+RETRY_COUNT = 3
+RETRY_DELAY = 5
+CACHE_TTL_HOURS = 24
 
-HISTORY_DIR = Path("history")
-HISTORY_DIR.mkdir(exist_ok=True)
 
-BATCH_SIZE = 50          # кол-во тикеров за один запрос к yfinance
-RETRY_COUNT = 3          # кол-во попыток при сетевой ошибке
-RETRY_DELAY = 5          # секунд между попытками
-CACHE_TTL_HOURS = 24     # время жизни кэша
+def _init_dirs() -> None:
+    """Creates runtime directories and configures logging. Called once from main()."""
+    LOG_DIR.mkdir(exist_ok=True)
+    CACHE_DIR.mkdir(exist_ok=True)
+    HISTORY_DIR.mkdir(exist_ok=True)
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[
+            logging.FileHandler(LOG_DIR / "errors.log", encoding="utf-8"),
+            logging.StreamHandler(sys.stdout),
+        ],
+    )
 
 
 # ─────────────────────────────────────────────
@@ -102,11 +93,9 @@ def load_tickers(filepath: str) -> list[str]:
                     tickers.append(row[0].strip().upper())
 
     except FileNotFoundError:
-        logger.error(f"Файл не найден: {filepath}")
-        sys.exit(1)
+        raise FileNotFoundError(f"Ticker file not found: {filepath}")
     except Exception as e:
-        logger.error(f"Ошибка чтения файла тикеров: {e}")
-        sys.exit(1)
+        raise RuntimeError(f"Error reading ticker file: {e}") from e
 
     # Убираем дубликаты, сохраняем порядок
     seen = set()
@@ -579,6 +568,9 @@ def generate_html(
         gap = row.get("gap_percent", 0)
         rng = row.get("intraday_range", 0)
         ticker = row["ticker"]
+        ticker_e = html.escape(str(ticker))
+        name_e   = html.escape(str(row.get("name", ticker)))
+        sector_e = html.escape(str(row.get("sector", "N/A")))
 
         # Цвет строки по % изменению
         if pct >= 10:
@@ -602,15 +594,15 @@ def generate_html(
 
         rows_html += f"""
         <tr class="{row_class}"
-            data-ticker="{ticker}"
-            data-sector="{row.get('sector', 'N/A')}"
+            data-ticker="{ticker_e}"
+            data-sector="{sector_e}"
             data-cap="{row.get('market_cap', 0)}"
             data-volume="{row.get('volume', 0)}">
             <td>
-                <a href="{yahoo_url}" target="_blank" class="ticker-link fw-bold">{ticker}</a>
+                <a href="{yahoo_url}" target="_blank" class="ticker-link fw-bold">{ticker_e}</a>
             </td>
-            <td class="company-name">{row.get('name', ticker)}</td>
-            <td><span class="badge sector-badge">{row.get('sector', 'N/A')}</span></td>
+            <td class="company-name">{name_e}</td>
+            <td><span class="badge sector-badge">{sector_e}</span></td>
             <td>${row.get('open', 0):.2f}</td>
             <td>${row.get('high', 0):.2f}</td>
             <td>${row.get('low', 0):.2f}</td>
@@ -1053,70 +1045,62 @@ function exportCSV() {{
 # 12. UNIT-ТЕСТЫ
 # ─────────────────────────────────────────────
 
-# class TestStockScreener(unittest.TestCase):
-#     """Простые тесты для ключевых функций скринера."""
-#
-#     def _make_df(self, data: list[dict]) -> pd.DataFrame:
-#         return pd.DataFrame(data)
-#
-#     # Тест 1: расчёт percent_change
-#     def test_percent_change(self):
-#         df = self._make_df([
-#             {"ticker": "AAPL", "open": 100.0, "high": 110.0, "low": 99.0, "close": 108.0, "volume": 1_000_000, "prev_close": 98.0},
-#             {"ticker": "TSLA", "open": 200.0, "high": 220.0, "low": 195.0, "close": 190.0, "volume": 2_000_000, "prev_close": 195.0},
-#         ])
-#         result = calculate_metrics(df)
-#         self.assertAlmostEqual(result.loc[0, "percent_change"], 8.0, places=1)
-#         self.assertAlmostEqual(result.loc[1, "percent_change"], -5.0, places=1)
-#
-#     # Тест 2: расчёт gap_percent
-#     def test_gap_percent(self):
-#         df = self._make_df([
-#             {"ticker": "X", "open": 110.0, "high": 115.0, "low": 108.0, "close": 112.0, "volume": 600_000, "prev_close": 100.0},
-#         ])
-#         result = calculate_metrics(df)
-#         self.assertAlmostEqual(result.loc[0, "gap_percent"], 10.0, places=1)
-#
-#     # Тест 3: фильтрация по percent_change
-#     def test_filter_by_change(self):
-#         df = self._make_df([
-#             {"ticker": "A", "open": 100, "high": 120, "low": 99, "close": 115, "volume": 1_000_000, "prev_close": 100, "percent_change": 15.0, "gap_percent": 0, "intraday_range": 10},
-#             {"ticker": "B", "open": 100, "high": 105, "low": 99, "close": 103, "volume": 1_000_000, "prev_close": 100, "percent_change": 3.0,  "gap_percent": 0, "intraday_range": 5},
-#         ])
-#         result = filter_data(df, min_change=5.0, min_volume=500_000, min_close=5.0)
-#         self.assertEqual(len(result), 1)
-#         self.assertEqual(result.iloc[0]["ticker"], "A")
-#
-#     # Тест 4: фильтрация по объёму
-#     def test_filter_by_volume(self):
-#         df = self._make_df([
-#             {"ticker": "C", "open": 10, "high": 12, "low": 9, "close": 11, "volume": 100_000, "prev_close": 10, "percent_change": 10.0, "gap_percent": 0, "intraday_range": 10},
-#         ])
-#         result = filter_data(df, min_change=5.0, min_volume=500_000, min_close=5.0)
-#         self.assertEqual(len(result), 0)
-#
-#     # Тест 5: пустые данные
-#     def test_empty_dataframe(self):
-#         df = pd.DataFrame()
-#         result = calculate_metrics(df)
-#         self.assertTrue(result.empty)
-#         result2 = filter_data(df)
-#         self.assertTrue(result2.empty)
-#
-#     # Тест 6: деление на ноль (open = 0)
-#     def test_zero_open(self):
-#         df = self._make_df([
-#             {"ticker": "Z", "open": 0, "high": 5, "low": 0, "close": 5, "volume": 600_000, "prev_close": 4},
-#         ])
-#         result = calculate_metrics(df)
-#         # Не должно падать; percent_change будет NaN
-#         self.assertTrue(pd.isna(result.loc[0, "percent_change"]) or True)
-#
-#     # Тест 7: format_market_cap
-#     def test_format_market_cap(self):
-#         self.assertEqual(format_market_cap(1_500_000_000), "$1.50B")
-#         self.assertEqual(format_market_cap(250_000_000), "$250.0M")
-#         self.assertEqual(format_market_cap(0), "N/A")
+class TestStockScreener(unittest.TestCase):
+    """Unit tests for core screener functions."""
+
+    def _make_df(self, data: list[dict]) -> pd.DataFrame:
+        return pd.DataFrame(data)
+
+    def test_percent_change(self):
+        df = self._make_df([
+            {"ticker": "AAPL", "open": 100.0, "high": 110.0, "low": 99.0, "close": 108.0, "volume": 1_000_000, "prev_close": 98.0},
+            {"ticker": "TSLA", "open": 200.0, "high": 220.0, "low": 195.0, "close": 190.0, "volume": 2_000_000, "prev_close": 195.0},
+        ])
+        result = calculate_metrics(df)
+        self.assertAlmostEqual(result.loc[0, "percent_change"], 8.0, places=1)
+        self.assertAlmostEqual(result.loc[1, "percent_change"], -5.0, places=1)
+
+    def test_gap_percent(self):
+        df = self._make_df([
+            {"ticker": "X", "open": 110.0, "high": 115.0, "low": 108.0, "close": 112.0, "volume": 600_000, "prev_close": 100.0},
+        ])
+        result = calculate_metrics(df)
+        self.assertAlmostEqual(result.loc[0, "gap_percent"], 10.0, places=1)
+
+    def test_filter_by_change(self):
+        df = self._make_df([
+            {"ticker": "A", "open": 100, "high": 120, "low": 99, "close": 115, "volume": 1_000_000, "prev_close": 100, "percent_change": 15.0, "gap_percent": 0, "intraday_range": 10},
+            {"ticker": "B", "open": 100, "high": 105, "low": 99, "close": 103, "volume": 1_000_000, "prev_close": 100, "percent_change": 3.0,  "gap_percent": 0, "intraday_range": 5},
+        ])
+        result = filter_data(df, min_change=5.0, min_volume=500_000, min_close=5.0)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result.iloc[0]["ticker"], "A")
+
+    def test_filter_by_volume(self):
+        df = self._make_df([
+            {"ticker": "C", "open": 10, "high": 12, "low": 9, "close": 11, "volume": 100_000, "prev_close": 10, "percent_change": 10.0, "gap_percent": 0, "intraday_range": 10},
+        ])
+        result = filter_data(df, min_change=5.0, min_volume=500_000, min_close=5.0)
+        self.assertEqual(len(result), 0)
+
+    def test_empty_dataframe(self):
+        df = pd.DataFrame()
+        result = calculate_metrics(df)
+        self.assertTrue(result.empty)
+        result2 = filter_data(df)
+        self.assertTrue(result2.empty)
+
+    def test_zero_open(self):
+        df = self._make_df([
+            {"ticker": "Z", "open": 0, "high": 5, "low": 0, "close": 5, "volume": 600_000, "prev_close": 4},
+        ])
+        result = calculate_metrics(df)
+        self.assertTrue(pd.isna(result.loc[0, "percent_change"]))
+
+    def test_format_market_cap(self):
+        self.assertEqual(format_market_cap(1_500_000_000), "$1.50B")
+        self.assertEqual(format_market_cap(250_000_000), "$250.0M")
+        self.assertEqual(format_market_cap(0), "N/A")
 
 
 def run_tests() -> bool:
@@ -1149,7 +1133,7 @@ def parse_args() -> argparse.Namespace:
         """,
     )
     parser.add_argument("--file",       default="tickers.csv",  help="CSV-файл с тикерами")
-    parser.add_argument("--min-change", type=float, default=5.0, help="Минимальный % изменения (default: 5)")
+    parser.add_argument("--min-change", type=float, default=5.0, help="Минимальный %% изменения (default: 5)")
     parser.add_argument("--min-volume", type=int, default=500_000, help="Минимальный объём (default: 500000)")
     parser.add_argument("--min-close",  type=float, default=5.0,   help="Минимальная цена закрытия (default: 5)")
     parser.add_argument("--days",       type=int, default=1,        help="Смещение дней назад (default: 1 = вчера)")
@@ -1165,6 +1149,10 @@ def parse_args() -> argparse.Namespace:
 # ─────────────────────────────────────────────
 
 def main() -> None:
+    if sys.platform == "win32":
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
     args = parse_args()
 
     # Режим тестов
@@ -1172,12 +1160,18 @@ def main() -> None:
         success = run_tests()
         sys.exit(0 if success else 1)
 
+    _init_dirs()
+
     print("=" * 60)
     print("  📊 Stock Momentum Screener")
     print("=" * 60)
 
     # ── Шаг 1: загрузить тикеры ──
-    tickers = load_tickers(args.file)
+    try:
+        tickers = load_tickers(args.file)
+    except (FileNotFoundError, RuntimeError) as e:
+        logger.error(str(e))
+        sys.exit(1)
     if not tickers:
         logger.error("Список тикеров пуст.")
         sys.exit(1)
